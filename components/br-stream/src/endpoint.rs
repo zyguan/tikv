@@ -104,18 +104,19 @@ where
         scheduler: Scheduler<Task>,
     ) -> Result<()> {
         let tasks = meta_client.get_tasks().await?;
-        let mut watcher = meta_client.events_from(tasks.revision).await?;
         for task in tasks.inner {
-            info!("starts watch task {:?} from backup stream", task);
+            info!("backup stream watch task"; "task" => ?task);
             // move task to schedule
             if let Err(e) = scheduler.schedule(Task::WatchTask(task)) {
                 // TODO build a error handle mechanism #error 3
                 error!("backup stream schedule task failed"; "error" => ?e);
             }
         }
+
+        let mut watcher = meta_client.events_from(tasks.revision).await?;
         loop {
             if let Some(event) = watcher.stream.next().await {
-                debug!("backup stream received {:?} from etcd", event);
+                info!("backup stream watch event from etcd"; "event" => ?event);
                 match event {
                     MetadataEvent::AddTask { task } => {
                         let t = meta_client.get_task(&task).await?;
@@ -167,11 +168,21 @@ where
         if let Some(cli) = self.meta_client.as_ref() {
             let cli = cli.clone();
             let range_router = self.range_router.clone();
+
+            info!(
+                "register backup stream task";
+                "task" => ?task,
+            );
+
             self.pool.block_on(async move {
                 let task_name = task.info.get_name();
                 match cli.ranges_of_task(task_name).await {
                     Ok(ranges) => {
-                        debug!("backup stream register ranges to observer");
+                        info!(
+                            "register backup stream ranges";
+                            "task" => ?task,
+                            "ranges-count" => ranges.inner.len(),
+                        );
                         // TODO implement register ranges
                         range_router.lock().await.register_ranges(
                             task_name,
@@ -277,7 +288,7 @@ where
     type Task = Task;
 
     fn run(&mut self, task: Task) {
-        debug!("run backup-stream task"; "task" => ?task);
+        debug!("run backup stream task"; "task" => ?task);
         match task {
             Task::WatchTask(task) => self.on_register(task),
             Task::BatchEvent(events) => self.do_backup(events),

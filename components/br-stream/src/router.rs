@@ -189,6 +189,12 @@ impl RouterInner {
                 end: range.1,
                 task_name: task_name.to_string(),
             };
+            debug!(
+                "backup stream register observe range";
+                "task_name" => task_name,
+                "start_key" => &log_wrappers::Value::key(&key_range.0),
+                "end_key" => &log_wrappers::Value::key(&task_range.end),
+            );
             self.ranges.insert(key_range, task_range);
         }
     }
@@ -216,6 +222,12 @@ impl RouterInner {
     pub async fn on_event(&mut self, kv: ApplyEvent) -> Result<()> {
         let prefix = &self.prefix;
         if let Some(task) = self.get_task_by_key(&kv.key) {
+            debug!(
+                "backup stream kv";
+                "cmdtype" => ?kv.cmd_type,
+                "cf" => ?kv.cf,
+                "key" => &log_wrappers::Value::key(&kv.key),
+            );
             let inner_router = {
                 if !self.temp_files_of_task.contains_key(&task) {
                     self.temp_files_of_task
@@ -229,8 +241,17 @@ impl RouterInner {
             // When this event make the size of temporary files exceeds the size limit, make a flush.
             // Note that we only flush if the size is less than the limit before the event,
             // or we may send multiplied flush requests.
+
+            debug!(
+                "backup stream statics size";
+                "task" => ?task,
+                "prev_size" => prev_size,
+                "next_size" => inner_router.total_size(),
+                "size_limit" => self.temp_file_size_limit,
+            );
+
             if prev_size < self.temp_file_size_limit
-                && inner_router.total_size() > self.temp_file_size_limit
+                && inner_router.total_size() >= self.temp_file_size_limit
             {
                 // TODO: maybe delay the schedule when failure? (Why the scheduler doesn't support blocking send...)
                 self.scheduler

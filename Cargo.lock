@@ -420,6 +420,7 @@ dependencies = [
  "hex 0.4.2",
  "kvproto",
  "lazy_static",
+ "log_wrappers",
  "online_config",
  "openssl",
  "prometheus",
