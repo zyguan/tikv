@@ -665,9 +665,9 @@ where
         results: VecDeque<ExecResult<EK::Snapshot>>,
     ) {
         if self.host.pre_persist(&delegate.region, true, None) {
-            if !delegate.pending_remove {
-                delegate.maybe_write_apply_state(self);
-            }
+            // if !delegate.pending_remove {
+            delegate.maybe_write_apply_state(self);
+            // }
             self.commit_opt(delegate, false);
         } else {
             debug!("do not persist when finish_for";
