@@ -20,6 +20,12 @@ pub trait Store: Send {
     /// Fetch the provided key.
     fn get(&self, key: &Key, statistics: &mut Statistics) -> Result<Option<Value>>;
 
+    fn get_with_version(
+        &self,
+        key: &Key,
+        statistics: &mut Statistics,
+    ) -> Result<Option<(Value, Option<TimeStamp>)>>;
+
     /// Re-use last cursor to incrementally (if possible) fetch the provided
     /// key.
     fn incremental_get(&mut self, key: &Key) -> Result<Option<Value>>;
@@ -36,6 +42,12 @@ pub trait Store: Send {
         keys: &[Key],
         statistics: &mut Vec<Statistics>,
     ) -> Result<Vec<Result<Option<Value>>>>;
+
+    fn batch_get_with_version(
+        &self,
+        keys: &[Key],
+        statistics: &mut Vec<Statistics>,
+    ) -> Result<Vec<Result<Option<(Value, Option<TimeStamp>)>>>>;
 
     /// Retrieve a scanner over the bounds.
     fn scanner(
@@ -308,6 +320,22 @@ impl<S: Snapshot> Store for SnapshotStore<S> {
         Ok(v)
     }
 
+    fn get_with_version(
+        &self,
+        key: &Key,
+        statistics: &mut Statistics,
+    ) -> Result<Option<(Value, Option<TimeStamp>)>> {
+        let mut point_getter = PointGetterBuilder::new(self.snapshot.clone(), self.start_ts)
+            .fill_cache(self.fill_cache)
+            .isolation_level(self.isolation_level)
+            .bypass_locks(self.bypass_locks.clone())
+            .access_locks(self.access_locks.clone())
+            .build()?;
+        let v = point_getter.get_with_version(key)?;
+        statistics.add(&point_getter.take_statistics());
+        Ok(v)
+    }
+
     fn incremental_get(&mut self, key: &Key) -> Result<Option<Value>> {
         if self.point_getter_cache.is_none() {
             self.point_getter_cache = Some(
@@ -359,6 +387,27 @@ impl<S: Snapshot> Store for SnapshotStore<S> {
         let mut values = Vec::with_capacity(keys.len());
         for key in keys {
             let value = point_getter.get(key).map_err(Error::from);
+            values.push(value);
+            statistics.push(point_getter.take_statistics());
+        }
+        Ok(values)
+    }
+
+    fn batch_get_with_version(
+        &self,
+        keys: &[Key],
+        statistics: &mut Vec<Statistics>,
+    ) -> Result<Vec<Result<Option<(Value, Option<TimeStamp>)>>>> {
+        let mut point_getter = PointGetterBuilder::new(self.snapshot.clone(), self.start_ts)
+            .fill_cache(self.fill_cache)
+            .isolation_level(self.isolation_level)
+            .bypass_locks(self.bypass_locks.clone())
+            .access_locks(self.access_locks.clone())
+            .build()?;
+
+        let mut values = Vec::with_capacity(keys.len());
+        for key in keys {
+            let value = point_getter.get_with_version(key).map_err(Error::from);
             values.push(value);
             statistics.push(point_getter.take_statistics());
         }
@@ -536,6 +585,15 @@ impl Store for FixtureStore {
     }
 
     #[inline]
+    fn get_with_version(
+        &self,
+        key: &Key,
+        statistics: &mut Statistics,
+    ) -> Result<Option<(Value, Option<TimeStamp>)>> {
+        self.get(key, statistics).map(|opt| opt.map(|v| (v, None)))
+    }
+
+    #[inline]
     fn incremental_get(&mut self, key: &Key) -> Result<Option<Vec<u8>>> {
         let mut s = Statistics::default();
         self.get(key, &mut s)
@@ -564,6 +622,19 @@ impl Store for FixtureStore {
                 self.get(key, statistics.last_mut().unwrap())
             })
             .collect())
+    }
+
+    #[inline]
+    fn batch_get_with_version(
+        &self,
+        keys: &[Key],
+        statistics: &mut Vec<Statistics>,
+    ) -> Result<Vec<Result<Option<(Vec<u8>, Option<TimeStamp>)>>>> {
+        self.batch_get(keys, statistics).map(|xs| {
+            xs.into_iter()
+                .map(|res| res.map(|opt| opt.map(|v| (v, None))))
+                .collect()
+        })
     }
 
     #[inline]

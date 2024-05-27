@@ -168,13 +168,23 @@ impl<S: Snapshot> PointGetter<S> {
 
     /// Get the value of a user key.
     pub fn get(&mut self, user_key: &Key) -> Result<Option<Value>> {
+        self.get_with_version(user_key)
+            .map(|opt| opt.map(|(v, _)| v))
+    }
+
+    pub fn get_with_version(
+        &mut self,
+        user_key: &Key,
+    ) -> Result<Option<(Value, Option<TimeStamp>)>> {
         fail_point!("point_getter_get");
 
         if need_check_locks(self.isolation_level) {
             // Check locks that signal concurrent writes for `Si` or more recent writes for
             // `RcCheckTs`.
             if let Some(lock) = self.load_and_check_lock(user_key)? {
-                return self.load_data_from_lock(user_key, lock);
+                return self
+                    .load_data_from_lock(user_key, lock)
+                    .map(|opt| opt.map(|v| (v, None)));
             }
         }
 
@@ -218,11 +228,11 @@ impl<S: Snapshot> PointGetter<S> {
         }
     }
 
-    /// Load the value.
+    /// Load the value with its version.
     ///
     /// First, a correct version info in the Write CF will be sought. Then,
     /// value will be loaded from Default CF if necessary.
-    fn load_data(&mut self, user_key: &Key) -> Result<Option<Value>> {
+    fn load_data(&mut self, user_key: &Key) -> Result<Option<(Value, Option<TimeStamp>)>> {
         let mut use_near_seek = false;
         let mut seek_key = user_key.clone();
 
@@ -283,6 +293,7 @@ impl<S: Snapshot> PointGetter<S> {
         }
 
         let mut write = WriteRef::parse(self.write_cursor.value(&mut self.statistics.write))?;
+        let mut version = Key::decode_ts_from(self.write_cursor.key(&mut self.statistics.write))?;
         let mut owned_value: Vec<u8>; // To work around lifetime problem
         loop {
             if !write.check_gc_fence_as_latest_version(self.ts) {
@@ -295,19 +306,19 @@ impl<S: Snapshot> PointGetter<S> {
                     resource_metering::record_read_keys(1);
 
                     if self.omit_value {
-                        return Ok(Some(vec![]));
+                        return Ok(Some((vec![], Some(version))));
                     }
                     match write.short_value {
                         Some(value) => {
                             // Value is carried in `write`.
                             self.statistics.processed_size += user_key.len() + value.len();
-                            return Ok(Some(value.to_vec()));
+                            return Ok(Some((value.to_vec(), Some(version))));
                         }
                         None => {
                             let start_ts = write.start_ts;
                             let value = self.load_data_from_default_cf(start_ts, user_key)?;
                             self.statistics.processed_size += user_key.len() + value.len();
-                            return Ok(Some(value));
+                            return Ok(Some((value, Some(version))));
                         }
                     }
                 }
@@ -330,6 +341,7 @@ impl<S: Snapshot> PointGetter<S> {
                             }
                             self.statistics.write.get += 1;
                             write = WriteRef::parse(&owned_value)?;
+                            version = commit_ts;
                             assert!(
                                 write.write_type == WriteType::Put
                                     || write.write_type == WriteType::Delete,
@@ -351,6 +363,7 @@ impl<S: Snapshot> PointGetter<S> {
             }
             // No need to compare user key because it uses prefix seek.
             write = WriteRef::parse(self.write_cursor.value(&mut self.statistics.write))?;
+            version = Key::decode_ts_from(self.write_cursor.key(&mut self.statistics.write))?;
         }
     }
 

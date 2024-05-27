@@ -599,7 +599,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         mut ctx: Context,
         key: Key,
         start_ts: TimeStamp,
-    ) -> impl Future<Output = Result<(Option<Value>, KvGetStatistics)>> {
+    ) -> impl Future<Output = Result<(Option<(Value, Option<TimeStamp>)>, KvGetStatistics)>> {
         let stage_begin_ts = Instant::now();
         let deadline = Self::get_deadline(&ctx);
         const CMD: CommandKind = CommandKind::get;
@@ -686,7 +686,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                             false,
                         );
                         snap_store
-                            .get(&key, &mut statistics)
+                            .get_with_version(&key, &mut statistics)
                             // map storage::txn::Error -> storage::Error
                             .map_err(Error::from)
                             .map(|r| {
@@ -717,7 +717,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                             .as_ref()
                             .unwrap_or(&None)
                             .as_ref()
-                            .map_or(0, |v| v.len());
+                            .map_or(0, |(v, _)| v.len());
                     sample.add_read_bytes(read_bytes);
                     let quota_delay = quota_limiter.consume_sample(sample, true).await;
                     if !quota_delay.is_zero() {
@@ -1181,7 +1181,8 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         mut ctx: Context,
         keys: Vec<Key>,
         start_ts: TimeStamp,
-    ) -> impl Future<Output = Result<(Vec<Result<KvPair>>, KvGetStatistics)>> {
+    ) -> impl Future<Output = Result<(Vec<Result<(KvPair, Option<TimeStamp>)>>, KvGetStatistics)>>
+    {
         let stage_begin_ts = Instant::now();
         let deadline = Self::get_deadline(&ctx);
         const CMD: CommandKind = CommandKind::batch_get;
@@ -1275,7 +1276,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                         );
                         let mut stats = Statistics::default();
                         let result = snap_store
-                            .batch_get(&keys, &mut statistics)
+                            .batch_get_with_version(&keys, &mut statistics)
                             .map_err(Error::from)
                             .map(|v| {
                                 let kv_pairs: Vec<_> = v
@@ -1294,7 +1295,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                                         !(v.is_ok() && v.as_ref().unwrap().is_none())
                                     })
                                     .map(|(_, (v, k))| match v {
-                                        Ok(Some(x)) => Ok((k.into_raw().unwrap(), x)),
+                                        Ok(Some((v, t))) => Ok(((k.into_raw().unwrap(), v), t)),
                                         Err(e) => Err(Error::from(e)),
                                         _ => unreachable!(),
                                     })

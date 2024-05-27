@@ -45,7 +45,7 @@ use tikv_util::{
     worker::Scheduler,
 };
 use tracker::{set_tls_tracker_token, RequestInfo, RequestType, Tracker, GLOBAL_TRACKERS};
-use txn_types::{self, Key};
+use txn_types::{self, Key, TimeStamp};
 
 use super::batch::{BatcherBuilder, ReqBatcher};
 use crate::{
@@ -1550,6 +1550,7 @@ fn future_get<E: Engine, L: LockManager, F: KvFormat>(
     )));
     set_tls_tracker_token(tracker);
     let start = Instant::now();
+    let need_data_version = req.get_flags()&(GetFlags::NeedDataVersion as u32) > 0;
     let v = storage.get(
         req.take_context(),
         Key::from_raw(req.get_key()),
@@ -1575,7 +1576,12 @@ fn future_get<E: Engine, L: LockManager, F: KvFormat>(
                     });
                     set_time_detail(exec_detail_v2, duration, &stats.latency_stats);
                     match val {
-                        Some(val) => resp.set_value(val),
+                        Some((val, ver)) => {
+                            resp.set_value(val);
+                            if need_data_version {
+                                resp.set_version(ver.unwrap_or_default().into_inner());
+                            }
+                        }
                         None => resp.set_not_found(true),
                     }
                 }
@@ -1669,6 +1675,7 @@ fn future_batch_get<E: Engine, L: LockManager, F: KvFormat>(
     )));
     set_tls_tracker_token(tracker);
     let start = Instant::now();
+    let need_data_version = req.get_flags()&(GetFlags::NeedDataVersion as u32) > 0;
     let keys = req.get_keys().iter().map(|x| Key::from_raw(x)).collect();
     let v = storage.batch_get(req.take_context(), keys, req.get_version().into());
 
@@ -1680,7 +1687,14 @@ fn future_batch_get<E: Engine, L: LockManager, F: KvFormat>(
             resp.set_region_error(err);
         } else {
             match v {
-                Ok((kv_res, stats)) => {
+                Ok((kv_res_with_ts, stats)) => {
+                    let (kv_res, ts): (Vec<_>, Vec<_>) = kv_res_with_ts
+                        .into_iter()
+                        .map(|res| match res {
+                            Ok((kv, t)) => (Ok(kv), t.unwrap_or_default().into_inner()),
+                            Err(e) => (Err(e), TimeStamp::default().into_inner()),
+                        })
+                        .unzip();
                     let pairs = map_kv_pairs(kv_res);
                     let exec_detail_v2 = resp.mut_exec_details_v2();
                     stats
@@ -1692,6 +1706,9 @@ fn future_batch_get<E: Engine, L: LockManager, F: KvFormat>(
                     });
                     set_time_detail(exec_detail_v2, duration, &stats.latency_stats);
                     resp.set_pairs(pairs.into());
+                    if need_data_version {
+                        resp.set_versions(ts);
+                    }
                 }
                 Err(e) => {
                     let key_error = extract_key_error(&e);
