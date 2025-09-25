@@ -685,14 +685,6 @@ where
                                     log_wrappers::Value::value(existing_value),
                                     log_wrappers::Value::value(value)
                                 );
-
-                                // TODO: remove this in production or new release.
-                                panic!(
-                                    "[for debug] found duplicate PUT on lock cf: key={:?}, existing_value={:?}, new_value={:?} during apply",
-                                    log_wrappers::Value::key(key),
-                                    log_wrappers::Value::value(existing_value),
-                                    log_wrappers::Value::value(value)
-                                );
                             } else {
                                 lock_cf_map.insert(key.to_vec(), value.to_vec());
                             }

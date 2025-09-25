@@ -173,9 +173,15 @@ impl TaskContext {
     fn on_schedule(&mut self) {
         let elapsed = self.latch_timer.saturating_elapsed();
         if let Some(task) = &self.task.as_ref() {
+            let elapsed_ns = elapsed.as_nanos() as u64;
             GLOBAL_TRACKERS.with_tracker(task.tracker_token(), |tracker| {
-                tracker.metrics.latch_wait_nanos = elapsed.as_nanos() as u64;
+                tracker.metrics.latch_wait_nanos = elapsed_ns;
             });
+            info!(
+                ">>> latches acquired: cid={}, elapsed={}",
+                task.cid(),
+                elapsed_ns
+            );
         }
         SCHED_LATCH_HISTOGRAM_VEC
             .get(self.tag)
@@ -557,6 +563,7 @@ impl<E: Engine, L: LockManager> TxnScheduler<E, L> {
         for wcid in wakeup_list {
             self.try_to_wake_up(wcid);
         }
+        info!(">>> latches released"; "cid" => cid);
     }
 
     fn schedule_command(
@@ -1823,6 +1830,7 @@ impl<E: Engine, L: LockManager> TxnScheduler<E, L> {
             && self.pessimistic_lock_mode() == PessimisticLockMode::Pipelined;
         let txn_ext = snapshot.ext().get_txn_ext().cloned();
         let deadline = task.cmd().deadline();
+        let ts = task.cmd().ts();
         let write_result = Self::handle_task(self.clone(), snapshot, task, sched_details).await;
 
         let mut write_result = match deadline
@@ -1846,6 +1854,8 @@ impl<E: Engine, L: LockManager> TxnScheduler<E, L> {
         };
 
         // TODO: remove this check when the cause of issue 18498 is located.
+        let mut put_lock_keys: Vec<txn_types::Key> = vec![];
+        let mut del_lock_keys: Vec<txn_types::Key> = vec![];
         if txn_types::ENABLE_DUP_KEY_DEBUG.load(Ordering::Relaxed)
             && !write_result.to_be_write.modifies.is_empty()
         {
@@ -1890,7 +1900,20 @@ impl<E: Engine, L: LockManager> TxnScheduler<E, L> {
                         }
                     }
                 }
+                match modify {
+                    Modify::Put(CF_LOCK, ..) => {
+                        put_lock_keys.push(modify.key().to_owned());
+                    }
+                    Modify::Delete(CF_LOCK, _) => {
+                        del_lock_keys.push(modify.key().to_owned());
+                    }
+                    _ => {}
+                }
             }
+            info!(
+                ">>> async write: cid={}, ts={}, cmd={}, put_locks={:?}, del_locks={:?}",
+                cid, ts, tag, put_lock_keys, del_lock_keys
+            )
         }
 
         SCHED_STAGE_COUNTER_VEC.get(tag).write.inc();
