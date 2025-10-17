@@ -185,6 +185,10 @@ impl Lock {
         }
     }
 
+    pub fn new_in_share_mode() -> Self {
+        unimplemented!();
+    }
+
     #[must_use]
     pub fn use_async_commit(mut self, secondaries: Vec<Vec<u8>>) -> Self {
         self.use_async_commit = true;
@@ -581,6 +585,36 @@ impl Lock {
 
     pub fn is_pessimistic_lock_with_conflict(&self) -> bool {
         self.is_pessimistic_lock() && self.is_locked_with_conflict
+    }
+
+    pub fn is_shared(&self) -> bool {
+        false
+    }
+
+    pub fn find_shared_lock_by_ts(&self, ts: TimeStamp) -> Option<SharedLock> {
+        None
+    }
+
+    pub fn put_shared_lock(&mut self, shared_lock: SharedLock) {
+        unimplemented!();
+    }
+}
+
+#[derive(Clone, PartialEq)]
+pub struct SharedLock {
+    pub lock_type: LockType,
+    pub primary: Box<[u8]>,
+    pub start_ts: TimeStamp,
+    pub ttl: u64,
+    pub for_update_ts: TimeStamp,
+    pub min_commit_ts: TimeStamp,
+
+    pub is_locked_with_conflict: bool,
+}
+
+impl SharedLock {
+    pub fn is_pessimistic_lock(&self) -> bool {
+        self.lock_type == LockType::Pessimistic
     }
 }
 

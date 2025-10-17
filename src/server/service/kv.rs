@@ -2366,6 +2366,7 @@ txn_command_future!(future_prewrite, PrewriteRequest, PrewriteResponse, (v, resp
 txn_command_future!(future_acquire_pessimistic_lock, PessimisticLockRequest, PessimisticLockResponse,
     (req) {
         let mode = req.get_wake_up_mode()
+        // TODO(zyguan): maybe validate the request: primary key should not be in shared mode
     };
     (v, resp, tracker) {{
         match v {

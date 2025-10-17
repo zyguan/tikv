@@ -35,7 +35,7 @@ use std::{
     sync::Arc,
 };
 
-pub use acquire_pessimistic_lock::AcquirePessimisticLock;
+pub use acquire_pessimistic_lock::{AcquirePessimisticLock, LockingKey};
 pub use acquire_pessimistic_lock_resumed::AcquirePessimisticLockResumed;
 pub use atomic_store::RawAtomicStore;
 pub use check_secondary_locks::CheckSecondaryLocks;
@@ -217,10 +217,11 @@ impl From<PessimisticLockRequest> for TypedCommand<StorageResult<PessimisticLock
             .take_mutations()
             .into_iter()
             .map(|x| match x.get_op() {
-                Op::PessimisticLock => (
-                    Key::from_raw(x.get_key()),
-                    x.get_assertion() == Assertion::NotExist,
-                ),
+                Op::PessimisticLock => LockingKey {
+                    key: Key::from_raw(x.get_key()),
+                    should_not_exist: x.get_assertion() == Assertion::NotExist,
+                    shared: false, // // TODO(slock): set it properly
+                },
                 _ => panic!("mismatch Op in pessimistic lock mutations"),
             })
             .collect();

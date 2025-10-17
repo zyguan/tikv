@@ -22,6 +22,13 @@ use crate::storage::{
     Snapshot,
 };
 
+#[derive(Clone, Debug)]
+pub struct LockingKey {
+    pub key: Key,
+    pub should_not_exist: bool,
+    pub shared: bool,
+}
+
 command! {
     /// Acquire a Pessimistic lock on the keys.
     ///
@@ -35,7 +42,7 @@ command! {
         }
         content => {
             /// The set of keys to lock.
-            keys: Vec<(Key, bool)>,
+            keys: Vec<LockingKey>,
             /// The primary lock. Secondary locks (from `keys`) will refer to the primary lock.
             primary: Vec<u8>,
             /// The transaction timestamp.
@@ -70,11 +77,11 @@ impl CommandExt for AcquirePessimisticLock {
     fn write_bytes(&self) -> usize {
         self.keys
             .iter()
-            .map(|(key, _)| key.as_encoded().len())
+            .map(|LockingKey { key, .. }| key.as_encoded().len())
             .sum()
     }
 
-    gen_lock!(keys: multiple(|x| &x.0));
+    gen_lock!(keys: multiple(|x| &x.key));
 }
 
 impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for AcquirePessimisticLock {
@@ -98,7 +105,12 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for AcquirePessimisticLock 
         let mut encountered_locks = vec![];
         let need_old_value = context.extra_op == ExtraOp::ReadOldValue;
         let mut old_values = OldValues::default();
-        for (k, should_not_exist) in keys {
+        for LockingKey {
+            key: k,
+            should_not_exist,
+            shared,
+        } in keys
+        {
             match acquire_pessimistic_lock(
                 &mut txn,
                 &mut reader,
@@ -113,6 +125,7 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for AcquirePessimisticLock 
                 need_old_value,
                 self.lock_only_if_exists,
                 self.allow_lock_with_conflict,
+                shared,
             ) {
                 Ok((key_res, old_value)) => {
                     res.push(key_res);

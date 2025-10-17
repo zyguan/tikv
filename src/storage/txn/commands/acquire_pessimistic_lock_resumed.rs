@@ -151,6 +151,7 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for AcquirePessimisticLockR
                 need_old_value,
                 params.lock_only_if_exists,
                 true,
+                false, // TODO(slock): set it properly
             ) {
                 Ok((key_res, old_value)) => {
                     res.push(key_res);

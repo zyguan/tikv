@@ -2,7 +2,10 @@
 
 use kvproto::kvrpcpb::WriteConflictReason;
 // #[PerformanceCriticalPath]
-use txn_types::{Key, LastChange, OldValue, PessimisticLock, TimeStamp, Value, Write, WriteType};
+use txn_types::{
+    Key, LastChange, Lock, OldValue, PessimisticLock, SharedLock, TimeStamp, Value, Write,
+    WriteType,
+};
 
 use crate::storage::{
     mvcc::{
@@ -51,6 +54,7 @@ pub fn acquire_pessimistic_lock<S: Snapshot>(
     need_old_value: bool,
     lock_only_if_exists: bool,
     allow_lock_with_conflict: bool,
+    shared: bool,
 ) -> MvccResult<(PessimisticLockKeyResult, OldValue)> {
     fail_point!("acquire_pessimistic_lock", |err| Err(
         crate::storage::mvcc::txn::make_txn_error(err, &key, reader.start_ts).into()
@@ -82,32 +86,31 @@ pub fn acquire_pessimistic_lock<S: Snapshot>(
     // `load_old_value` doing repeated work.
     let mut need_load_value = need_value || (need_check_existence && need_old_value);
 
-    fn load_old_value<S: Snapshot>(
-        need_old_value: bool,
-        value_loaded: bool,
-        val: Option<&Value>,
-        reader: &mut SnapshotReader<S>,
-        key: &Key,
-        for_update_ts: TimeStamp,
-        prev_write_loaded: bool,
-        prev_write: Option<Write>,
-    ) -> MvccResult<OldValue> {
-        if !need_old_value {
-            return Ok(OldValue::Unspecified);
-        }
-        if value_loaded {
-            // The old value must be loaded to `val` when `need_value` is set.
-            Ok(match val {
-                Some(val) => OldValue::Value { value: val.clone() },
-                None => OldValue::None,
-            })
-        } else {
-            reader.get_old_value(key, for_update_ts, prev_write_loaded, prev_write)
-        }
-    }
-
     let mut val = None;
     if let Some(lock) = reader.load_lock(&key)? {
+        if lock.is_shared() {
+            if !shared {
+                // currently upgrading shared lock to exclusive lock is unsupported
+                return Err(ErrorInner::KeyIsLocked(lock.into_lock_info(key.into_raw()?)).into());
+            }
+            return acquire_pessimistic_lock_in_shared_mode(
+                txn,
+                reader,
+                key,
+                primary,
+                should_not_exist,
+                lock_ttl,
+                for_update_ts,
+                need_value,
+                need_check_existence,
+                min_commit_ts,
+                need_old_value,
+                lock_only_if_exists,
+                allow_lock_with_conflict,
+                need_load_value,
+                Some(lock),
+            );
+        }
         if lock.ts != reader.start_ts {
             return Err(ErrorInner::KeyIsLocked(lock.into_lock_info(key.into_raw()?)).into());
         }
@@ -224,6 +227,25 @@ pub fn acquire_pessimistic_lock<S: Snapshot>(
             ),
             old_value,
         ));
+    }
+    if shared {
+        return acquire_pessimistic_lock_in_shared_mode(
+            txn,
+            reader,
+            key,
+            primary,
+            should_not_exist,
+            lock_ttl,
+            for_update_ts,
+            need_value,
+            need_check_existence,
+            min_commit_ts,
+            need_old_value,
+            lock_only_if_exists,
+            allow_lock_with_conflict,
+            need_load_value,
+            None,
+        );
     }
 
     let mut conflict_info = None;
@@ -396,6 +418,335 @@ pub fn acquire_pessimistic_lock<S: Snapshot>(
     ))
 }
 
+fn acquire_pessimistic_lock_in_shared_mode<S: Snapshot>(
+    txn: &mut MvccTxn,
+    reader: &mut SnapshotReader<S>,
+    key: Key,
+    primary: &[u8],
+    should_not_exist: bool,
+    lock_ttl: u64,
+    mut for_update_ts: TimeStamp,
+    need_value: bool,
+    need_check_existence: bool,
+    min_commit_ts: TimeStamp,
+    need_old_value: bool,
+    lock_only_if_exists: bool,
+    allow_lock_with_conflict: bool,
+    mut need_load_value: bool,
+    existing_lock: Option<Lock>,
+) -> MvccResult<(PessimisticLockKeyResult, OldValue)> {
+    let mut conflict_info = None;
+    let mut val = None;
+    let (prev_write_loaded, mut prev_write) = (true, None);
+
+    let mut lock = if existing_lock.is_some() {
+        existing_lock.unwrap()
+    } else {
+        let mut last_change;
+
+        if let Some((commit_ts, write)) = reader.seek_write(&key, TimeStamp::max())? {
+            // Find a previous write.
+            if need_old_value {
+                prev_write = Some(write.clone());
+            }
+
+            // TODO(slock): special handling for the shared lock?
+
+            // The isolation level of pessimistic transactions is RC. `for_update_ts` is
+            // the commit_ts of the data this transaction read. If exists a commit version
+            // whose commit timestamp is larger than current `for_update_ts`, the
+            // transaction should retry to get the latest data.
+            if commit_ts > for_update_ts {
+                MVCC_CONFLICT_COUNTER
+                    .acquire_pessimistic_lock_conflict
+                    .inc();
+                if allow_lock_with_conflict {
+                    // TODO: New metrics.
+                    conflict_info = Some(ConflictInfo {
+                        conflict_start_ts: write.start_ts,
+                        conflict_commit_ts: commit_ts,
+                    });
+                    for_update_ts = commit_ts;
+                    need_load_value = true;
+                } else {
+                    return Err(ErrorInner::WriteConflict {
+                        start_ts: reader.start_ts,
+                        conflict_start_ts: write.start_ts,
+                        conflict_commit_ts: commit_ts,
+                        key: key.into_raw()?,
+                        primary: primary.to_vec(),
+                        reason: WriteConflictReason::PessimisticRetry,
+                    }
+                    .into());
+                }
+            }
+
+            // Handle rollback.
+            // The rollback information may come from either a Rollback record or a record
+            // with `has_overlapped_rollback` flag.
+            if commit_ts == reader.start_ts
+                && (write.write_type == WriteType::Rollback || write.has_overlapped_rollback)
+            {
+                assert!(write.has_overlapped_rollback || write.start_ts == commit_ts);
+                return Err(ErrorInner::PessimisticLockRolledBack {
+                    start_ts: reader.start_ts,
+                    key: key.into_raw()?,
+                }
+                .into());
+            }
+            // If `commit_ts` we seek is already before `start_ts`, the rollback must not
+            // exist.
+            if commit_ts > reader.start_ts {
+                if let Some((older_commit_ts, older_write)) =
+                    reader.seek_write(&key, reader.start_ts)?
+                {
+                    if older_commit_ts == reader.start_ts
+                        && (older_write.write_type == WriteType::Rollback
+                            || older_write.has_overlapped_rollback)
+                    {
+                        return Err(ErrorInner::PessimisticLockRolledBack {
+                            start_ts: reader.start_ts,
+                            key: key.into_raw()?,
+                        }
+                        .into());
+                    }
+                }
+            }
+
+            // Check data constraint when acquiring pessimistic lock.
+            check_data_constraint(reader, should_not_exist, &write, commit_ts, &key).or_else(
+                |e| {
+                    if is_already_exist(&e) {
+                        // If `allow_lock_with_conflict` is set and there is write conflict,
+                        // and the constraint check doesn't pass on the latest version,
+                        // return a WriteConflict error instead of AlreadyExist, to inform the
+                        // client to retry.
+                        if let Some(conflict_info) = conflict_info {
+                            return Err(conflict_info.into_write_conflict_error(
+                                reader.start_ts,
+                                primary.to_vec(),
+                                key.to_raw()?,
+                            ));
+                        }
+                    }
+                    Err(e)
+                },
+            )?;
+
+            last_change = next_last_change_info(&key, &write, txn.start_ts, reader, commit_ts)?;
+
+            // Load value if locked_with_conflict, so that when the client (TiDB) need to
+            // read the value during statement retry, it will be possible to read the value
+            // from cache instead of RPC.
+            if need_value || need_check_existence || conflict_info.is_some() {
+                val = match write.write_type {
+                    // If it's a valid Write, no need to read again.
+                    WriteType::Put
+                        if write
+                            .as_ref()
+                            .check_gc_fence_as_latest_version(reader.start_ts) =>
+                    {
+                        if need_load_value {
+                            Some(reader.load_data(&key, write)?)
+                        } else {
+                            Some(vec![])
+                        }
+                    }
+                    WriteType::Delete | WriteType::Put => None,
+                    WriteType::Lock | WriteType::Rollback => { // TODO(slock): ...
+                        if need_load_value {
+                            reader.get(&key, commit_ts.prev())?
+                        } else {
+                            reader.get_write(&key, commit_ts.prev())?.map(|_| vec![])
+                        }
+                    }
+                };
+            }
+        } else {
+            last_change = LastChange::NotExist;
+        }
+        if !tls_can_enable(LAST_CHANGE_TS) {
+            last_change = LastChange::Unknown;
+        }
+
+        Lock::new_in_share_mode().set_last_change(last_change)
+    };
+
+    if let Some(mut shared_lock) = lock.find_shared_lock_by_ts(reader.start_ts) {
+        if !shared_lock.is_pessimistic_lock() {
+            return Err(ErrorInner::LockTypeNotMatch {
+                start_ts: reader.start_ts,
+                key: key.into_raw()?,
+                pessimistic: false,
+            }
+            .into());
+        }
+
+        let requested_for_update_ts = for_update_ts;
+        let locked_with_conflict_ts =
+            if allow_lock_with_conflict && for_update_ts < shared_lock.for_update_ts {
+                // If the key is already locked by the same transaction with larger
+                // for_update_ts, and the current request has
+                // `allow_lock_with_conflict` set, we must consider
+                // these possibilities:
+                // * A previous request successfully locked the key with conflict, but the
+                //   response is lost due to some errors such as RPC failures. In this case, we
+                //   return like the current request's result is locked_with_conflict, for
+                //   idempotency concern.
+                // * The key is locked by a newer request with larger for_update_ts, and the
+                //   current request is stale. We can't distinguish this case with the above
+                //   one, but we don't need to handle this case since no one would need the
+                //   current request's result anymore.
+
+                // Load value if locked_with_conflict, so that when the client (TiDB) need to
+                // read the value during statement retry, it will be possible to read the value
+                // from cache instead of RPC.
+                need_load_value = true;
+                for_update_ts = shared_lock.for_update_ts;
+                Some(shared_lock.for_update_ts)
+            } else {
+                None
+            };
+
+        if need_load_value || need_check_existence || should_not_exist {
+            let write = reader.get_write_with_commit_ts(&key, for_update_ts)?;
+            if let Some((write, commit_ts)) = write {
+                // Here `get_write_with_commit_ts` returns only the latest PUT if it exists and
+                // is not deleted. It's still ok to pass it into `check_data_constraint`.
+                check_data_constraint(reader, should_not_exist, &write, commit_ts, &key).or_else(
+                    |e| {
+                        if is_already_exist(&e) && commit_ts > requested_for_update_ts {
+                            // If `allow_lock_with_conflict` is set and there is write conflict,
+                            // and the constraint check doesn't pass on the latest version,
+                            // return a WriteConflict error instead of AlreadyExist, to inform the
+                            // client to retry.
+                            // Note the conflict_info may be not consistent with the
+                            // `locked_with_conflict_ts` we got before.
+                            // This is possible if the key is locked by a newer request with
+                            // larger for_update_ts, in which case the result of this request
+                            // doesn't matter at all. So we don't need
+                            // to care about it.
+                            let conflict_info = ConflictInfo {
+                                conflict_start_ts: write.start_ts,
+                                conflict_commit_ts: commit_ts,
+                            };
+                            return Err(conflict_info.into_write_conflict_error(
+                                reader.start_ts,
+                                primary.to_vec(),
+                                key.to_raw()?,
+                            ));
+                        }
+                        Err(e)
+                    },
+                )?;
+
+                if need_load_value {
+                    val = Some(reader.load_data(&key, write)?);
+                } else if need_check_existence {
+                    val = Some(vec![]);
+                }
+            }
+        }
+        // Previous write is not loaded.
+        let (prev_write_loaded, prev_write) = (false, None);
+        let old_value = load_old_value(
+            need_old_value,
+            need_load_value,
+            val.as_ref(),
+            reader,
+            &key,
+            for_update_ts,
+            prev_write_loaded,
+            prev_write,
+        )?;
+
+        // Overwrite the lock with small for_update_ts
+        if for_update_ts > shared_lock.for_update_ts {
+            shared_lock.for_update_ts = for_update_ts;
+            lock.put_shared_lock(shared_lock);
+            txn.put_lock(key, &lock, false);
+        } else {
+            MVCC_DUPLICATE_CMD_COUNTER_VEC
+                .acquire_pessimistic_lock
+                .inc();
+        }
+        return Ok((
+            PessimisticLockKeyResult::new_success(
+                need_value,
+                need_check_existence,
+                locked_with_conflict_ts,
+                val,
+            ),
+            old_value,
+        ));
+    }
+
+    if !lock_only_if_exists || val.is_some() {
+        let shared_lock = SharedLock {
+            lock_type: txn_types::LockType::Pessimistic,
+            primary: primary.into(),
+            start_ts: reader.start_ts,
+            ttl: lock_ttl,
+            for_update_ts,
+            min_commit_ts,
+            is_locked_with_conflict: conflict_info.is_some(),
+        };
+        lock.put_shared_lock(shared_lock);
+        txn.put_lock(key, &lock, true);
+    } else if let Some(conflict_info) = conflict_info {
+        return Err(conflict_info.into_write_conflict_error(
+            reader.start_ts,
+            primary.to_vec(),
+            key.into_raw()?,
+        ));
+    }
+
+    let old_value = load_old_value(
+        need_old_value,
+        need_load_value,
+        val.as_ref(),
+        reader,
+        &key,
+        for_update_ts,
+        prev_write_loaded,
+        prev_write,
+    )?;
+
+    Ok((
+        PessimisticLockKeyResult::new_success(
+            need_value,
+            need_check_existence,
+            conflict_info.map(ConflictInfo::into_locked_with_conflict_ts),
+            val,
+        ),
+        old_value,
+    ))
+}
+
+fn load_old_value<S: Snapshot>(
+    need_old_value: bool,
+    value_loaded: bool,
+    val: Option<&Value>,
+    reader: &mut SnapshotReader<S>,
+    key: &Key,
+    for_update_ts: TimeStamp,
+    prev_write_loaded: bool,
+    prev_write: Option<Write>,
+) -> MvccResult<OldValue> {
+    if !need_old_value {
+        return Ok(OldValue::Unspecified);
+    }
+    if value_loaded {
+        // The old value must be loaded to `val` when `need_value` is set.
+        Ok(match val {
+            Some(val) => OldValue::Value { value: val.clone() },
+            None => OldValue::None,
+        })
+    } else {
+        reader.get_old_value(key, for_update_ts, prev_write_loaded, prev_write)
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ConflictInfo {
     conflict_start_ts: TimeStamp,
@@ -485,6 +836,7 @@ pub mod tests {
             false,
             lock_only_if_exists,
             true,
+            false,
         );
         if res.is_ok() {
             let modifies = txn.into_modifies();
@@ -555,6 +907,7 @@ pub mod tests {
             min_commit_ts,
             false,
             lock_only_if_exists,
+            false,
             false,
         )
         .unwrap();
@@ -737,6 +1090,7 @@ pub mod tests {
             min_commit_ts,
             false,
             lock_only_if_exists,
+            false,
             false,
         )
         .unwrap_err()
@@ -1346,6 +1700,7 @@ pub mod tests {
                         need_old_value,
                         false,
                         false,
+                        false,
                     )
                     .unwrap();
                     assert_eq!(old_value, OldValue::None);
@@ -1396,6 +1751,7 @@ pub mod tests {
             need_check_existence,
             min_commit_ts,
             need_old_value,
+            false,
             false,
             false,
         )
@@ -1477,6 +1833,7 @@ pub mod tests {
                             need_old_value,
                             false,
                             false,
+                            false,
                         )?;
                         Ok(old_value)
                     });
@@ -1529,6 +1886,7 @@ pub mod tests {
             need_check_existence,
             min_commit_ts,
             need_old_value,
+            false,
             false,
             false,
         )
