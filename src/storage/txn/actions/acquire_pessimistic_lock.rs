@@ -86,8 +86,8 @@ pub fn acquire_pessimistic_lock<S: Snapshot>(
     let mut need_load_value = need_value || (need_check_existence && need_old_value);
 
     let mut val = None;
-    let current_lock = reader.load_lock(&key)?;
-    if let Some(lock) = current_lock.as_ref() {
+    let mut current_lock = reader.load_lock(&key)?;
+    if let Some(lock) = current_lock.as_mut() {
         if !is_shared_lock_req {
             // handle exclusive lock.
             if lock.is_shared() {
@@ -134,6 +134,12 @@ pub fn acquire_pessimistic_lock<S: Snapshot>(
                     allow_lock_with_conflict,
                     current_lock.unwrap(),
                 );
+            }
+            if lock.is_shrink_only() {
+                return Err(ErrorInner::KeyIsLocked(
+                    current_lock.unwrap().into_lock_info(key.into_raw()?),
+                )
+                .into());
             }
             // Fall through to add a new lock.
         }

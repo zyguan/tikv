@@ -1,7 +1,7 @@
 // Copyright 2023 TiKV Project Authors. Licensed under Apache-2.0.
 
 use tikv_kv::Snapshot;
-use txn_types::{Key, LastChange, OldValue, TimeStamp, Write, WriteType};
+use txn_types::{Key, LastChange, Lock, OldValue, TimeStamp, Write, WriteType};
 
 use crate::storage::mvcc::{MvccTxn, Result, SnapshotReader, TxnCommitRecord};
 
@@ -87,5 +87,24 @@ pub fn check_committed_record_on_err(
             Ok((vec![], commit_ts))
         }
         _ => Err(prewrite_result.unwrap_err().into()),
+    }
+}
+
+pub fn set_shared_lock_shrink_only(
+    txn: &mut MvccTxn,
+    reader: &mut SnapshotReader<impl Snapshot>,
+    key: Key,
+) -> Result<Option<Lock>> {
+    match reader.load_lock(&key)? {
+        Some(mut lock) => {
+            if lock.is_shared() && !lock.is_shrink_only() {
+                lock.set_shrink_only();
+                txn.put_lock(key, &lock, false);
+                Ok(Some(lock))
+            } else {
+                Ok(None)
+            }
+        }
+        None => Ok(None),
     }
 }

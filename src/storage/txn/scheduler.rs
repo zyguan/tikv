@@ -1418,6 +1418,8 @@ impl<E: Engine, L: LockManager> TxnScheduler<E, L> {
             known_txn_status,
         } = write_result;
 
+        let mut skip_in_memory_pessimistic_lock = false;
+
         // Process the possible encountered locks.
         if !lock_info.is_empty() {
             match tag {
@@ -1429,10 +1431,18 @@ impl<E: Engine, L: LockManager> TxnScheduler<E, L> {
                     // that it's a lock-no-wait request and we need to report error
                     // immediately.
                     if lock_info.parameters.wait_timeout.is_some() {
-                        assert_eq!(to_be_write.size(), 0);
-                        pr = ProcessResult::Res;
-
-                        txn_scheduler.on_wait_for_lock(&ctx, cid, lock_info, tracker_token);
+                        if lock_info.set_lock_shrink_only {
+                            skip_in_memory_pessimistic_lock = true;
+                            pr = ProcessResult::PessimisticLockRes {
+                                res: Err(StorageError::from(Error::from(MvccError::from(
+                                    MvccErrorInner::KeyIsLocked(lock_info.lock_info_pb),
+                                )))),
+                            };
+                        } else {
+                            assert_eq!(to_be_write.size(), 0);
+                            pr = ProcessResult::Res;
+                            txn_scheduler.on_wait_for_lock(&ctx, cid, lock_info, tracker_token);
+                        }
                     } else {
                         // For requests with `allow_lock_with_conflict`, key errors are set
                         // key-wise. TODO: It's better to return this error
@@ -1494,6 +1504,7 @@ impl<E: Engine, L: LockManager> TxnScheduler<E, L> {
             CommandKind::acquire_pessimistic_lock | CommandKind::acquire_pessimistic_lock_resumed
         ) && txn_scheduler.pessimistic_lock_mode() == PessimisticLockMode::InMemory
             && !is_shared_lock_cmd
+            && !skip_in_memory_pessimistic_lock
             && txn_scheduler.try_write_in_memory_pessimistic_locks(
                 txn_ext.as_deref(),
                 &mut to_be_write,

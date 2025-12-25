@@ -698,6 +698,7 @@ impl<K: PrewriteKind> Prewriter<K> {
                     final_min_commit_ts = TimeStamp::zero();
                 }
                 Err(MvccError(box MvccErrorInner::KeyIsLocked { .. })) => {
+                    // TODO(slock): turn a slock to shrink-only to avoid starvation.
                     match check_committed_record_on_err(prewrite_result, txn, reader, &key) {
                         Ok(res) => return Ok(res),
                         Err(e) => locks.push(Err(e.into())),

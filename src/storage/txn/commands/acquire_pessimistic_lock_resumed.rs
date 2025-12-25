@@ -6,7 +6,7 @@ use std::{
 };
 
 // #[PerformanceCriticalPath]
-use kvproto::kvrpcpb::ExtraOp;
+use kvproto::kvrpcpb::{ExtraOp, Op};
 use txn_types::{insert_old_value_if_resolved, Key, OldValues};
 
 use crate::storage::{
@@ -165,9 +165,19 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for AcquirePessimisticLockR
                         None,
                     );
                 }
-                Err(MvccError(box MvccErrorInner::KeyIsLocked(lock_info))) => {
-                    let mut lock_info =
-                        WriteResultLockInfo::new(lock_info, params, key, should_not_exist, false);
+                Err(MvccError(box MvccErrorInner::KeyIsLocked(lock_info)))
+                    // TODO(slock): skip handling non-shrink-only slocks
+                    if lock_info.get_lock_type() != Op::SharedLock
+                        || lock_info.get_shrink_only() =>
+                {
+                    let mut lock_info = WriteResultLockInfo::new(
+                        lock_info,
+                        params,
+                        key,
+                        should_not_exist,
+                        false,
+                        false,
+                    );
                     lock_info.lock_wait_token = lock_wait_token;
                     lock_info.req_states = Some(req_states);
                     res.push(PessimisticLockKeyResult::Waiting);

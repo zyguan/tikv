@@ -46,6 +46,7 @@ const _RESERVED_PREFIX: u8 = b'T'; // Reserved for future use.
 const PESSIMISTIC_LOCK_WITH_CONFLICT_PREFIX: u8 = b'F';
 const GENERATION_PREFIX: u8 = b'g';
 const SHARED_LOCK_TXNS_INFO_PREFIX: u8 = b'h';
+const SHRINK_ONLY_PREFIX: u8 = b'K';
 
 impl LockType {
     pub fn from_mutation(mutation: &Mutation) -> Option<LockType> {
@@ -125,6 +126,9 @@ pub struct Lock {
     /// Only valid when `lock_type` is `LockType::Shared`, otherwise the value
     /// is `None`.
     pub shared_lock_txns_info: Option<SharedLockTxnsInfo>,
+
+    /// Indicates that the shared lock is shrink-only.
+    pub shrink_only: bool,
 }
 
 impl std::fmt::Debug for Lock {
@@ -153,6 +157,7 @@ impl std::fmt::Debug for Lock {
             .field("is_locked_with_conflict", &self.is_locked_with_conflict)
             .field("generation", &self.generation)
             .field("shared_lock_txns_info", &self.shared_lock_txns_info)
+            .field("shrink_only", &self.shrink_only)
             .finish()
     }
 }
@@ -200,6 +205,7 @@ impl Lock {
             is_locked_with_conflict,
             generation: 0,
             shared_lock_txns_info: None,
+            shrink_only: false,
         }
     }
 
@@ -262,6 +268,17 @@ impl Lock {
 
     #[inline]
     #[must_use]
+    pub fn is_shrink_only(&self) -> bool {
+        self.shrink_only
+    }
+
+    #[inline]
+    pub fn set_shrink_only(&mut self) {
+        self.shrink_only = true;
+    }
+
+    #[inline]
+    #[must_use]
     pub fn contains_start_ts(&self, start_ts: &TimeStamp) -> bool {
         match self.lock_type {
             LockType::Shared => self
@@ -312,6 +329,7 @@ impl Lock {
     #[inline]
     pub fn put_shared_lock(&mut self, lock: Lock) {
         assert!(self.is_shared());
+        assert!(!self.is_shrink_only());
         match lock.lock_type {
             LockType::Lock => {
                 // Prewriting a shared lock guarantees that no non-shared lock with commit_ts >
@@ -451,6 +469,9 @@ impl Lock {
             b.push(GENERATION_PREFIX);
             b.encode_u64(self.generation).unwrap();
         }
+        if self.shrink_only {
+            b.push(SHRINK_ONLY_PREFIX);
+        }
         if let Some(info) = &self.shared_lock_txns_info {
             debug_assert!(
                 self.lock_type == LockType::Shared,
@@ -513,6 +534,9 @@ impl Lock {
         }
         if self.generation > 0 {
             size += 1 + size_of::<u64>();
+        }
+        if self.shrink_only {
+            size += 1;
         }
         if let Some(info) = &self.shared_lock_txns_info {
             size += 1
@@ -589,6 +613,7 @@ impl Lock {
         let mut txn_source = 0;
         let mut is_locked_with_conflict = false;
         let mut generation = 0;
+        let mut shrink_only = false;
         let mut shared_lock_txns_info = None;
         while !b.is_empty() {
             match b.read_u8()? {
@@ -636,6 +661,9 @@ impl Lock {
                 GENERATION_PREFIX => {
                     generation = number::decode_u64(&mut b)?;
                 }
+                SHRINK_ONLY_PREFIX => {
+                    shrink_only = true;
+                }
                 SHARED_LOCK_TXNS_INFO_PREFIX => {
                     let len = number::decode_var_u64(&mut b)? as usize;
                     let mut segments = HashMap::default();
@@ -677,6 +705,9 @@ impl Lock {
         if use_async_commit {
             lock = lock.use_async_commit(secondaries);
         }
+        if shrink_only {
+            lock.set_shrink_only();
+        }
         lock.shared_lock_txns_info = shared_lock_txns_info;
         Ok(lock)
     }
@@ -711,6 +742,7 @@ impl Lock {
         if let Some(shared_lock_infos) = shared_lock_infos {
             info.set_shared_lock_infos(shared_lock_infos.into());
         }
+        info.set_shrink_only(self.shrink_only);
         info.set_lock_for_update_ts(self.for_update_ts.into_inner());
         info.set_use_async_commit(self.use_async_commit);
         info.set_min_commit_ts(self.min_commit_ts.into_inner());
@@ -1285,6 +1317,11 @@ mod tests {
             .set_last_change(LastChange::make_exist(4.into(), 2))
             .set_txn_source(1)
             .with_generation(10),
+            {
+                let mut lock = Lock::new_in_shared_mode();
+                lock.set_shrink_only();
+                lock
+            },
             Lock::new(
                 LockType::Shared,
                 b"shared_pk".to_vec(),
@@ -1612,7 +1649,8 @@ mod tests {
             txn_source: 0, \
             is_locked_with_conflict: false, \
             generation: 0, \
-            shared_lock_txns_info: None \
+            shared_lock_txns_info: None, \
+            shrink_only: false \
             }"
         );
         log_wrappers::set_redact_info_log(log_wrappers::RedactOption::Flag(true));
@@ -1636,7 +1674,8 @@ mod tests {
             txn_source: 0, \
             is_locked_with_conflict: false, \
             generation: 0, \
-            shared_lock_txns_info: None \
+            shared_lock_txns_info: None, \
+            shrink_only: false \
             }"
         );
 
@@ -1662,13 +1701,15 @@ mod tests {
             txn_source: 0, \
             is_locked_with_conflict: false, \
             generation: 0, \
-            shared_lock_txns_info: None \
+            shared_lock_txns_info: None, \
+            shrink_only: false \
             }"
         );
 
         lock.short_value = None;
         lock.secondaries = Vec::default();
         lock.generation = 10;
+        lock.set_shrink_only();
         assert_eq!(
             format!("{:?}", lock),
             "Lock { \
@@ -1687,7 +1728,8 @@ mod tests {
             txn_source: 0, \
             is_locked_with_conflict: false, \
             generation: 10, \
-            shared_lock_txns_info: None \
+            shared_lock_txns_info: None, \
+            shrink_only: true \
             }"
         );
         log_wrappers::set_redact_info_log(log_wrappers::RedactOption::Flag(true));
@@ -1711,7 +1753,8 @@ mod tests {
             txn_source: 0, \
             is_locked_with_conflict: false, \
             generation: 10, \
-            shared_lock_txns_info: None \
+            shared_lock_txns_info: None, \
+            shrink_only: true \
             }"
         );
     }
@@ -1745,6 +1788,7 @@ mod tests {
             is_locked_with_conflict: false,
             generation: 0,
             shared_lock_txns_info: None,
+            shrink_only: false,
         };
         assert_eq!(pessimistic_lock.to_lock(), expected_lock);
         assert_eq!(pessimistic_lock.into_lock(), expected_lock);
@@ -1946,5 +1990,45 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn test_shrink_only_shared_lock() {
+        let mut shared_lock = Lock::new_in_shared_mode();
+        let txn1_ts: TimeStamp = 5.into();
+        let txn1_lock = Lock::new(
+            LockType::Pessimistic,
+            b"txn1".to_vec(),
+            txn1_ts,
+            0,
+            None,
+            TimeStamp::zero(),
+            0,
+            TimeStamp::zero(),
+            false,
+        );
+        shared_lock.put_shared_lock(txn1_lock.clone());
+        assert!(!shared_lock.is_shrink_only());
+
+        shared_lock.set_shrink_only();
+        assert!(shared_lock.is_shrink_only());
+
+        // Test serialization
+        let bytes = shared_lock.to_bytes();
+        let mut parsed_lock = Lock::parse(&bytes).unwrap();
+        assert!(parsed_lock.is_shrink_only());
+        parsed_lock
+            .shared_lock_txns_info
+            .as_mut()
+            .unwrap()
+            .parse_all();
+        assert_eq!(shared_lock, parsed_lock);
+
+        // Test put_shared_lock panics
+        let result = std::panic::catch_unwind(move || {
+            let mut lock = parsed_lock;
+            lock.put_shared_lock(txn1_lock);
+        });
+        assert!(result.is_err());
     }
 }

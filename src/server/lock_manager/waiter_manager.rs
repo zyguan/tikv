@@ -28,7 +28,11 @@ use tikv_util::{
 use tokio::task::spawn_local;
 use tracker::GLOBAL_TRACKERS;
 
-use super::{config::Config, deadlock::Scheduler as DetectorScheduler, metrics::*};
+use super::{
+    config::Config,
+    deadlock::{LockInfoExt, Scheduler as DetectorScheduler},
+    metrics::*,
+};
 use crate::storage::{
     lock_manager::{
         CancellationCallback, DiagnosticContext, KeyLockWaitInfo, LockDigest, LockWaitToken,
@@ -582,6 +586,14 @@ impl WaiterManager {
             .borrow_mut()
             .take_waiter_by_lock_digest(lock, waiter_ts);
         if let Some(waiter) = waiter {
+            if waiter.wait_info.lock_info.is_shared() {
+                // When deadlock detected on a shared lock, some wait-for
+                // entries might have been registered to the detect table. So do
+                // clean up here to avoid those entries causing false-positive
+                // deadlock errors.
+                self.detector_scheduler
+                    .clean_up_wait_for(waiter_ts, waiter.wait_info.clone());
+            }
             waiter.cancel_for_deadlock(lock, key, deadlock_key_hash, wait_chain);
         }
     }

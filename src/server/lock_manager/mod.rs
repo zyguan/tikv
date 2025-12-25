@@ -28,7 +28,7 @@ pub use self::{
     waiter_manager::Scheduler as WaiterMgrScheduler,
 };
 use self::{
-    deadlock::Detector,
+    deadlock::{Detector, LockInfoExt},
     waiter_manager::{Waiter, WaiterManager},
 };
 use crate::{
@@ -290,10 +290,10 @@ impl LockManagerTrait for LockManager {
 
         // If it is the first lock the transaction tries to lock, it won't cause
         // deadlock.
-        // The lock waiting for shared lock is not tracked yet, because the shared lock
-        // may grow after this detection. After we implement the shrinking of
-        // shared lock, we can track it then.
-        if !is_first_lock && wait_info.lock_info.lock_type != kvproto::kvrpcpb::Op::SharedLock {
+        if !is_first_lock {
+            if wait_info.lock_info.is_shared() {
+                assert!(wait_info.lock_info.get_shrink_only());
+            }
             self.detector_scheduler
                 .detect(start_ts, wait_info, diag_ctx);
         }

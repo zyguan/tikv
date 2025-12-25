@@ -1,7 +1,7 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
 // #[PerformanceCriticalPath]
-use kvproto::kvrpcpb::ExtraOp;
+use kvproto::kvrpcpb::{ExtraOp, Op};
 use tikv_kv::Modify;
 use txn_types::{insert_old_value_if_resolved, Key, OldValues, TimeStamp, TxnExtra};
 
@@ -11,6 +11,7 @@ use crate::storage::{
     mvcc::{Error as MvccError, ErrorInner as MvccErrorInner, MvccTxn, SnapshotReader},
     txn::{
         acquire_pessimistic_lock,
+        actions::common::set_shared_lock_shrink_only,
         commands::{
             Command, CommandExt, ReaderWithStats, ReleasedLocks, ResponsePolicy, TypedCommand,
             WriteCommand, WriteContext, WriteResult, WriteResultLockInfo,
@@ -122,6 +123,22 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for AcquirePessimisticLock 
                     insert_old_value_if_resolved(&mut old_values, k, txn.start_ts, old_value, None);
                 }
                 Err(MvccError(box MvccErrorInner::KeyIsLocked(lock_info))) => {
+                    // Do not lock previously succeeded keys.
+                    txn.clear();
+                    res.0.clear();
+                    res.push(PessimisticLockKeyResult::Waiting);
+
+                    // If a xlock meets a non-shrink-only slock, set the
+                    // `shrink_only` flag on the existing slock.
+                    let set_lock_shrink_only = if !is_shared_lock
+                        && lock_info.get_lock_type() == Op::SharedLock
+                        && !lock_info.get_shrink_only()
+                    {
+                        set_shared_lock_shrink_only(&mut txn, &mut reader, k.clone())?.is_some()
+                    } else {
+                        false
+                    };
+
                     let request_parameters = PessimisticLockParameters {
                         pb_ctx: ctx.clone(),
                         primary: self.primary.clone(),
@@ -142,12 +159,9 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for AcquirePessimisticLock 
                         k,
                         should_not_exist,
                         is_shared_lock,
+                        set_lock_shrink_only,
                     );
                     encountered_locks.push(lock_info);
-                    // Do not lock previously succeeded keys.
-                    txn.clear();
-                    res.0.clear();
-                    res.push(PessimisticLockKeyResult::Waiting);
                     break;
                 }
                 Err(e) => return Err(Error::from(e)),

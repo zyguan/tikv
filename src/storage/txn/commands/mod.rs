@@ -503,6 +503,9 @@ pub struct WriteResultLockInfo {
     pub hash_for_latch: u64,
     /// Whether the pending request is trying to acquire a shared lock.
     pub is_shared_lock_request: bool,
+    /// Whether the pending request is setting the `shrink_only` flag on a
+    /// shared lock.
+    pub set_lock_shrink_only: bool,
     /// If a request is woken up after waiting for some lock, and it encounters
     /// another lock again after resuming, this field will carry the token
     /// that was already allocated before.
@@ -519,6 +522,7 @@ impl WriteResultLockInfo {
         key: Key,
         should_not_exist: bool,
         is_shared_lock_request: bool,
+        set_lock_shrink_only: bool,
     ) -> Self {
         let lock = lock_manager::LockDigest {
             ts: lock_info_pb.get_lock_version().into(),
@@ -533,6 +537,7 @@ impl WriteResultLockInfo {
             parameters,
             hash_for_latch,
             is_shared_lock_request,
+            set_lock_shrink_only,
             lock_wait_token: LockWaitToken(None),
             req_states: None,
         }
