@@ -260,6 +260,7 @@ impl TikvServerCore {
         prometheus::register(Box::new(yatp::metrics::TASK_WAIT_DURATION.clone())).unwrap();
         prometheus::register(Box::new(yatp::metrics::TASK_POLL_DURATION.clone())).unwrap();
         prometheus::register(Box::new(yatp::metrics::TASK_EXEC_TIMES.clone())).unwrap();
+        prometheus::register(Box::new(yatp::metrics::TASK_WAKE_EVENT.clone())).unwrap();
     }
 
     pub fn init_encryption(&mut self) {

@@ -227,6 +227,9 @@ sysinfo = { git = "https://github.com/tikv/sysinfo", branch = "0.26-fix-cpu" }
 # [patch.'https://github.com/tikv/rust-rocksdb']
 # rocksdb = { git = "https://github.com/your_github_id/rust-rocksdb", branch = "your_branch" }
 
+[patch.'https://github.com/tikv/yatp']
+yatp = { git = "https://github.com/zyguan/yatp", branch = "dev/wake-event" }
+
 [workspace]
 # See https://github.com/rust-lang/rfcs/blob/master/text/2957-cargo-features2.md
 # Without resolver = 2, using `cargo build --features x` to build `cmd`
